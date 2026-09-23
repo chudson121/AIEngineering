@@ -1,0 +1,38 @@
+# RA Section 6 – Regression comparison gates (candidate vs baseline)
+
+gates:
+  - metric: overall_score_delta
+    threshold: -0.03
+    direction: min        # delta must not drop more than -3pp
+    severity: blocking
+    description: "Candidate overall score must not regress beyond 3pp from baseline"
+
+  - metric: critical_case_pass_rate
+    threshold: 1.00
+    direction: min
+    severity: blocking
+    description: "All critical golden cases must still pass in candidate"
+
+  - metric: golden_set_score_delta
+    threshold: -0.02
+    direction: min
+    severity: blocking
+    description: "Golden set score delta threshold vs baseline"
+
+  - metric: boundary_set_score_delta
+    threshold: -0.05
+    direction: min
+    severity: warning
+    description: "Boundary/edge case score delta"
+
+  - metric: adversarial_set_pass_rate_delta
+    threshold: -0.02
+    direction: min
+    severity: blocking
+    description: "Adversarial suite must not regress"
+
+  - metric: historical_failure_regression_count
+    threshold: 0
+    direction: max
+    severity: blocking
+    description: "Previously fixed failures must not reappear"

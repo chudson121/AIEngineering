@@ -1,0 +1,308 @@
+name: "02 · Retrieval Relevance & Groundedness Evaluation"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage: PR CI → Staging
+# RA Section 5.2 – Retrieval relevance and groundedness
+# RA Section 5.3 – Response correctness and hallucination testing
+# Tools: RAGAS, DeepEval, LangSmith, MLflow
+# LLM Providers: OpenAI, Anthropic (Claude), Azure OpenAI – chosen via env var
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_run:
+    workflows: ["01 · Validate Artifacts & Contracts"]
+    types: [completed]
+    branches: [main, develop, "release/**"]
+  workflow_dispatch:
+    inputs:
+      dataset_version:
+        description: "Eval dataset version/tag (default: latest)"
+        required: false
+        default: "latest"
+      llm_provider:
+        description: "LLM judge provider"
+        required: true
+        default: "openai"
+        type: choice
+        options: [openai, azure_openai, anthropic]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
+  LANGSMITH_PROJECT: ${{ vars.LANGSMITH_PROJECT }}
+  LLM_PROVIDER: ${{ inputs.llm_provider || vars.DEFAULT_LLM_PROVIDER || 'openai' }}
+
+jobs:
+  # ──────────────────────────────────────────────────────
+  # Job 1 – Pull eval dataset from DVC / cloud storage
+  # ──────────────────────────────────────────────────────
+  pull-eval-dataset:
+    name: "Pull Evaluation Dataset"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    outputs:
+      dataset_path: ${{ steps.pull.outputs.dataset_path }}
+      dataset_version: ${{ steps.pull.outputs.dataset_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install DVC
+        run: pip install "dvc[azure,s3]"
+
+      - name: Configure Azure storage
+        if: vars.CLOUD_PROVIDER == 'azure'
+        run: |
+          dvc remote modify origin account_name "${{ secrets.AZURE_STORAGE_ACCOUNT }}"
+          dvc remote modify origin sas_token    "${{ secrets.AZURE_SAS_TOKEN }}"
+
+      - name: Configure AWS S3 storage
+        if: vars.CLOUD_PROVIDER == 'aws'
+        run: |
+          dvc remote modify origin access_key_id     "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          dvc remote modify origin secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          dvc remote modify origin region_name       "${{ vars.AWS_REGION }}"
+
+      - name: Pull RAG evaluation dataset
+        id: pull
+        run: |
+          VERSION="${{ inputs.dataset_version || 'latest' }}"
+          dvc pull evals/datasets/rag_golden_set.dvc
+          echo "dataset_path=evals/datasets/rag_golden_set.jsonl" >> $GITHUB_OUTPUT
+          echo "dataset_version=$VERSION"                          >> $GITHUB_OUTPUT
+
+      - name: Cache dataset for downstream jobs
+        uses: actions/cache/save@v4
+        with:
+          path: evals/datasets/
+          key: eval-dataset-${{ github.sha }}
+
+  # ──────────────────────────────────────────────────────
+  # Job 2 – Retrieval relevance evaluation
+  # Tool: RAGAS (context_recall, context_precision, context_relevancy)
+  # ──────────────────────────────────────────────────────
+  retrieval-relevance:
+    name: "Retrieval Relevance (RAGAS)"
+    runs-on: ubuntu-latest
+    needs: pull-eval-dataset
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore dataset cache
+        uses: actions/cache/restore@v4
+        with:
+          path: evals/datasets/
+          key: eval-dataset-${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install RAGAS + LLM providers
+        run: |
+          pip install ragas langchain langchain-openai langchain-anthropic \
+                      mlflow boto3 azure-storage-blob rich
+
+      - name: Set LLM provider credentials
+        run: |
+          # Provider-agnostic credential resolution
+          if [ "${{ env.LLM_PROVIDER }}" = "azure_openai" ]; then
+            echo "OPENAI_API_TYPE=azure"                                      >> $GITHUB_ENV
+            echo "AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}" >> $GITHUB_ENV
+            echo "AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}"   >> $GITHUB_ENV
+            echo "AZURE_OPENAI_API_VERSION=2024-02-01"                        >> $GITHUB_ENV
+          elif [ "${{ env.LLM_PROVIDER }}" = "anthropic" ]; then
+            echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}"         >> $GITHUB_ENV
+          else
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"               >> $GITHUB_ENV
+          fi
+
+      - name: Run RAGAS retrieval evaluation
+        run: |
+          python scripts/eval_retrieval.py \
+            --dataset   evals/datasets/rag_golden_set.jsonl \
+            --provider  ${{ env.LLM_PROVIDER }} \
+            --metrics   context_recall,context_precision,context_relevancy \
+            --output    reports/retrieval_metrics.json \
+            --mlflow-experiment "retrieval-eval" \
+            --mlflow-run-name   "${{ github.sha }}-retrieval"
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ${{ env.LANGSMITH_PROJECT }}
+
+      - name: Check retrieval thresholds
+        # RA Section 6 – context_recall >= 0.85, context_precision >= 0.80
+        run: |
+          python scripts/check_thresholds.py \
+            --report  reports/retrieval_metrics.json \
+            --gates   config/thresholds/retrieval.yaml \
+            --fail-on-breach
+
+      - name: Upload retrieval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-metrics
+          path: reports/retrieval_metrics.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 3 – Groundedness & hallucination evaluation
+  # Tools: DeepEval (faithfulness, answer_relevancy, hallucination)
+  # ──────────────────────────────────────────────────────
+  groundedness-hallucination:
+    name: "Groundedness & Hallucination (DeepEval)"
+    runs-on: ubuntu-latest
+    needs: pull-eval-dataset
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore dataset cache
+        uses: actions/cache/restore@v4
+        with:
+          path: evals/datasets/
+          key: eval-dataset-${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install DeepEval + providers
+        run: |
+          pip install deepeval langchain-openai langchain-anthropic mlflow rich
+
+      - name: Resolve LLM credentials
+        run: |
+          if [ "${{ env.LLM_PROVIDER }}" = "azure_openai" ]; then
+            echo "AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}" >> $GITHUB_ENV
+            echo "AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}"   >> $GITHUB_ENV
+            echo "AZURE_OPENAI_DEPLOYMENT_NAME=${{ vars.AZURE_JUDGE_DEPLOYMENT }}" >> $GITHUB_ENV
+          elif [ "${{ env.LLM_PROVIDER }}" = "anthropic" ]; then
+            echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}"         >> $GITHUB_ENV
+          else
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"               >> $GITHUB_ENV
+          fi
+
+      - name: Run groundedness + hallucination tests
+        run: |
+          python scripts/eval_groundedness.py \
+            --dataset   evals/datasets/rag_golden_set.jsonl \
+            --provider  ${{ env.LLM_PROVIDER }} \
+            --output    reports/groundedness_metrics.json \
+            --mlflow-experiment "groundedness-eval" \
+            --mlflow-run-name   "${{ github.sha }}-groundedness"
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          DEEPEVAL_API_KEY:    ${{ secrets.DEEPEVAL_API_KEY }}
+          LANGSMITH_API_KEY:   ${{ secrets.LANGSMITH_API_KEY }}
+
+      - name: Enforce groundedness gate
+        # RA Section 6 – at least 95% of reviewed claims supported
+        run: |
+          python scripts/check_thresholds.py \
+            --report  reports/groundedness_metrics.json \
+            --gates   config/thresholds/groundedness.yaml \
+            --fail-on-breach
+
+      - name: Upload groundedness report
+        uses: actions/upload-artifact@v4
+        with:
+          name: groundedness-metrics
+          path: reports/groundedness_metrics.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 4 – Citation validity check
+  # Tool: custom checker + LangSmith tracing
+  # ──────────────────────────────────────────────────────
+  citation-validity:
+    name: "Citation Validity & Access Control"
+    runs-on: ubuntu-latest
+    needs: pull-eval-dataset
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore dataset cache
+        uses: actions/cache/restore@v4
+        with:
+          path: evals/datasets/
+          key: eval-dataset-${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install langsmith pydantic rich
+
+      - name: Run citation and ACL validation
+        run: |
+          python scripts/eval_citations.py \
+            --dataset   evals/datasets/rag_golden_set.jsonl \
+            --acl-rules config/acl-rules.yaml \
+            --output    reports/citation_validation.json
+        env:
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ${{ env.LANGSMITH_PROJECT }}
+
+      - name: Zero-unauthorized-access gate (hard block)
+        run: |
+          python scripts/check_thresholds.py \
+            --report  reports/citation_validation.json \
+            --gates   config/thresholds/security.yaml \
+            --fail-on-breach
+
+      - name: Upload citation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: citation-validity
+          path: reports/citation_validation.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 5 – Aggregate and log results to MLflow
+  # ──────────────────────────────────────────────────────
+  log-results:
+    name: "Aggregate & Log to MLflow + LangSmith"
+    runs-on: ubuntu-latest
+    needs: [retrieval-relevance, groundedness-hallucination, citation-validity]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-metrics"
+          merge-multiple: true
+          path: reports/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install MLflow
+        run: pip install mlflow rich
+
+      - name: Push aggregated results to MLflow
+        run: |
+          python scripts/log_eval_results.py \
+            --reports-dir reports/ \
+            --experiment  "rag-eval-pipeline" \
+            --run-name    "${{ github.sha }}" \
+            --tags        "git_sha=${{ github.sha }},branch=${{ github.ref_name }},provider=${{ env.LLM_PROVIDER }}"
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}

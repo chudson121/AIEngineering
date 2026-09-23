@@ -1,0 +1,311 @@
+name: "03 · Agent Task Completion & Tool-Call Accuracy"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage: Staging / Pre-release
+# RA Section 5.4 – Agent task completion and tool-call accuracy
+# RA Section 5.5 – Security, privacy, and robustness
+# Tools: LangSmith, MLflow, custom sandbox harness, pytest
+# LLM Providers: OpenAI, Azure OpenAI, Anthropic – selected via LLM_PROVIDER var
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_run:
+    workflows: ["02 · Retrieval Relevance & Groundedness Evaluation"]
+    types: [completed]
+    branches: [main, "release/**"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target sandbox environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, integration]
+      agent_task_set:
+        description: "Task set to run (standard | adversarial | all)"
+        required: true
+        default: "all"
+
+permissions:
+  contents: read
+  id-token: write   # for OIDC auth to Azure / AWS
+
+env:
+  PYTHON_VERSION: "3.11"
+  TASK_SET: ${{ inputs.agent_task_set || 'all' }}
+  LLM_PROVIDER: ${{ vars.DEFAULT_LLM_PROVIDER || 'openai' }}
+  LANGSMITH_PROJECT: ${{ vars.LANGSMITH_PROJECT }}
+  MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
+
+jobs:
+  # ──────────────────────────────────────────────────────
+  # Job 1 – Provision ephemeral sandbox (Azure or AWS)
+  # Tools: Azure CLI / AWS CLI, Terraform (optional)
+  # ──────────────────────────────────────────────────────
+  provision-sandbox:
+    name: "Provision Agent Sandbox"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    environment: ${{ inputs.environment || 'staging' }}
+    outputs:
+      sandbox_id: ${{ steps.provision.outputs.sandbox_id }}
+      sandbox_url: ${{ steps.provision.outputs.sandbox_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (OIDC)
+        if: vars.CLOUD_PROVIDER == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to AWS (OIDC)
+        if: vars.CLOUD_PROVIDER == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ vars.AWS_REGION }}
+
+      - name: Provision ephemeral sandbox environment
+        id: provision
+        run: |
+          python scripts/provision_sandbox.py \
+            --cloud    ${{ vars.CLOUD_PROVIDER }} \
+            --env      ${{ inputs.environment || 'staging' }} \
+            --git-sha  ${{ github.sha }} \
+            --output   sandbox-info.json
+
+          SANDBOX_ID=$(jq -r '.sandbox_id' sandbox-info.json)
+          SANDBOX_URL=$(jq -r '.sandbox_url' sandbox-info.json)
+          echo "sandbox_id=$SANDBOX_ID"   >> $GITHUB_OUTPUT
+          echo "sandbox_url=$SANDBOX_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload sandbox info
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-info
+          path: sandbox-info.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 2 – Tool-call schema & argument validation
+  # Tool: pytest + mocked tool responses
+  # RA Section 5.4, layer 1 & 2
+  # ──────────────────────────────────────────────────────
+  tool-call-validation:
+    name: "Tool-Call Schema & Argument Validation"
+    runs-on: ubuntu-latest
+    needs: provision-sandbox
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install pytest pytest-asyncio langchain langchain-openai langchain-anthropic pydantic rich
+
+      - name: Resolve LLM credentials
+        run: |
+          if [ "${{ env.LLM_PROVIDER }}" = "azure_openai" ]; then
+            echo "AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}"     >> $GITHUB_ENV
+            echo "AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}"       >> $GITHUB_ENV
+            echo "AZURE_OPENAI_DEPLOYMENT_NAME=${{ vars.AZURE_AGENT_DEPLOYMENT }}" >> $GITHUB_ENV
+          elif [ "${{ env.LLM_PROVIDER }}" = "anthropic" ]; then
+            echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}"             >> $GITHUB_ENV
+          else
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"                   >> $GITHUB_ENV
+          fi
+
+      - name: Run tool-call validation tests (mocked tools)
+        run: |
+          pytest tests/agent/tool_calls/ \
+            --provider=${{ env.LLM_PROVIDER }} \
+            --junitxml=reports/tool-call-tests.xml \
+            -v --tb=short
+        env:
+          LANGSMITH_API_KEY:   ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT:   ${{ env.LANGSMITH_PROJECT }}
+
+      - name: Upload tool-call report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-call-tests
+          path: reports/tool-call-tests.xml
+
+  # ──────────────────────────────────────────────────────
+  # Job 3 – Agent task completion (sandbox integration)
+  # Tools: LangSmith tracing, custom agent harness
+  # RA Section 5.4, layers 3 & 4 – trajectory + terminal state
+  # ──────────────────────────────────────────────────────
+  agent-task-completion:
+    name: "Agent Task Completion (Sandbox)"
+    runs-on: ubuntu-latest
+    needs: [provision-sandbox, tool-call-validation]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install agent evaluation dependencies
+        run: |
+          pip install langchain langchain-openai langchain-anthropic \
+                      langsmith mlflow pytest pytest-asyncio rich pydantic
+
+      - name: Restore sandbox info
+        uses: actions/download-artifact@v4
+        with:
+          name: sandbox-info
+
+      - name: Resolve LLM credentials
+        run: |
+          if [ "${{ env.LLM_PROVIDER }}" = "azure_openai" ]; then
+            echo "AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}"     >> $GITHUB_ENV
+            echo "AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}"       >> $GITHUB_ENV
+            echo "AZURE_OPENAI_DEPLOYMENT_NAME=${{ vars.AZURE_AGENT_DEPLOYMENT }}" >> $GITHUB_ENV
+          elif [ "${{ env.LLM_PROVIDER }}" = "anthropic" ]; then
+            echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}"             >> $GITHUB_ENV
+          else
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"                   >> $GITHUB_ENV
+          fi
+
+      - name: Run standard agent task suite
+        if: ${{ env.TASK_SET == 'standard' || env.TASK_SET == 'all' }}
+        run: |
+          python scripts/run_agent_tasks.py \
+            --task-set   evals/datasets/agent_standard_tasks.jsonl \
+            --sandbox    $(jq -r '.sandbox_url' sandbox-info.json) \
+            --provider   ${{ env.LLM_PROVIDER }} \
+            --output     reports/agent_standard_results.json \
+            --trace-project "${{ env.LANGSMITH_PROJECT }}" \
+            --mlflow-experiment "agent-eval"
+        env:
+          LANGSMITH_API_KEY:   ${{ secrets.LANGSMITH_API_KEY }}
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+
+      - name: Run adversarial agent task suite
+        if: ${{ env.TASK_SET == 'adversarial' || env.TASK_SET == 'all' }}
+        run: |
+          python scripts/run_agent_tasks.py \
+            --task-set   evals/datasets/agent_adversarial_tasks.jsonl \
+            --sandbox    $(jq -r '.sandbox_url' sandbox-info.json) \
+            --provider   ${{ env.LLM_PROVIDER }} \
+            --output     reports/agent_adversarial_results.json \
+            --trace-project "${{ env.LANGSMITH_PROJECT }}-adversarial"
+        env:
+          LANGSMITH_API_KEY:   ${{ secrets.LANGSMITH_API_KEY }}
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+
+      - name: Enforce agent completion gate
+        # RA Section 6 – ≥90% standard tasks reach verified terminal state
+        run: |
+          python scripts/check_thresholds.py \
+            --report  reports/agent_standard_results.json \
+            --gates   config/thresholds/agent.yaml \
+            --fail-on-breach
+
+      - name: Upload agent task results
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-task-results
+          path: reports/agent_*.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 4 – Prompt injection & security robustness
+  # Tool: DeepEval + custom injection fixture runner
+  # RA Section 5.5 – Security, privacy, robustness
+  # ──────────────────────────────────────────────────────
+  security-robustness:
+    name: "Prompt Injection & Security Robustness"
+    runs-on: ubuntu-latest
+    needs: provision-sandbox
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install deepeval langchain-openai langchain-anthropic rich
+
+      - name: Resolve LLM credentials
+        run: |
+          if [ "${{ env.LLM_PROVIDER }}" = "azure_openai" ]; then
+            echo "AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}" >> $GITHUB_ENV
+            echo "AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}"   >> $GITHUB_ENV
+          elif [ "${{ env.LLM_PROVIDER }}" = "anthropic" ]; then
+            echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}"         >> $GITHUB_ENV
+          else
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"               >> $GITHUB_ENV
+          fi
+
+      - name: Run prompt injection test suite
+        run: |
+          python scripts/eval_security.py \
+            --fixtures  evals/datasets/security_fixtures.jsonl \
+            --provider  ${{ env.LLM_PROVIDER }} \
+            --output    reports/security_results.json
+        env:
+          DEEPEVAL_API_KEY: ${{ secrets.DEEPEVAL_API_KEY }}
+
+      - name: Zero unauthorized action gate (HARD BLOCK)
+        run: |
+          python scripts/check_thresholds.py \
+            --report  reports/security_results.json \
+            --gates   config/thresholds/security.yaml \
+            --fail-on-breach
+
+      - name: Upload security results
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-results
+          path: reports/security_results.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 5 – Teardown ephemeral sandbox
+  # ──────────────────────────────────────────────────────
+  teardown-sandbox:
+    name: "Teardown Sandbox"
+    runs-on: ubuntu-latest
+    needs: [agent-task-completion, security-robustness]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (OIDC)
+        if: vars.CLOUD_PROVIDER == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to AWS (OIDC)
+        if: vars.CLOUD_PROVIDER == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ vars.AWS_REGION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sandbox-info
+
+      - name: Destroy ephemeral sandbox
+        run: |
+          python scripts/teardown_sandbox.py \
+            --sandbox-id $(jq -r '.sandbox_id' sandbox-info.json) \
+            --cloud ${{ vars.CLOUD_PROVIDER }}

@@ -1,0 +1,33 @@
+# RA Section 6 – Retrieval relevance thresholds
+# Adapt these values to your application's baseline and risk level.
+
+gates:
+  - metric: context_recall
+    threshold: 0.85
+    direction: min       # value must be >= threshold
+    severity: blocking
+    description: "At least 85% of relevant chunks recalled in top results"
+
+  - metric: context_precision
+    threshold: 0.80
+    direction: min
+    severity: blocking
+    description: "At least 80% of retrieved chunks are relevant"
+
+  - metric: context_relevancy
+    threshold: 0.80
+    direction: min
+    severity: blocking
+    description: "Average relevancy score across retrieval set"
+
+  - metric: answer_relevancy
+    threshold: 0.85
+    direction: min
+    severity: warning
+    description: "Answers address the user question (not only the corpus)"
+
+  - metric: unauthorized_chunk_rate
+    threshold: 0.00
+    direction: max       # value must be <= threshold (hard zero)
+    severity: blocking
+    description: "Zero unauthorized document retrievals (ACL enforcement)"

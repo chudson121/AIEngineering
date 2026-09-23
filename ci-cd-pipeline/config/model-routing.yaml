@@ -1,0 +1,43 @@
+# Model routing configuration – versioned alongside prompts and tools
+# Referenced by workflow 05 (versioning) and the runtime serving layer.
+# Extend or trim providers to match your enterprise agreements.
+
+default_provider: openai          # overridden by LLM_PROVIDER env var
+
+providers:
+  openai:
+    type: openai
+    model: gpt-4o
+    fallback_model: gpt-4o-mini
+    max_tokens: 4096
+    temperature: 0.0
+    env_key: OPENAI_API_KEY
+
+  azure_openai:
+    type: azure_openai
+    deployment_name: ${AZURE_OPENAI_DEPLOYMENT_NAME}
+    api_version: "2024-02-01"
+    fallback_deployment: ${AZURE_OPENAI_FALLBACK_DEPLOYMENT}
+    max_tokens: 4096
+    temperature: 0.0
+    env_keys:
+      endpoint: AZURE_OPENAI_ENDPOINT
+      api_key:  AZURE_OPENAI_API_KEY
+
+  anthropic:
+    type: anthropic
+    model: claude-3-5-sonnet-20241022
+    fallback_model: claude-3-haiku-20240307
+    max_tokens: 4096
+    temperature: 0.0
+    env_key: ANTHROPIC_API_KEY
+
+  aws_bedrock:
+    type: bedrock
+    model_id: anthropic.claude-3-5-sonnet-20241022-v2:0
+    fallback_model_id: anthropic.claude-3-haiku-20240307-v1:0
+    region: ${AWS_BEDROCK_REGION}
+    # Auth: IAM role via OIDC – no separate API key needed
+
+judge_provider: openai            # LLM used for evaluation judging
+judge_model: gpt-4o

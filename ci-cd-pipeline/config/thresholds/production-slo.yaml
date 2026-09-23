@@ -1,0 +1,51 @@
+# RA Section 8.2 – Production operational SLO thresholds
+
+gates:
+  - metric: error_rate
+    threshold: 0.01
+    direction: max
+    severity: critical
+    alert: pagerduty
+    description: "Request error rate must stay below 1%"
+
+  - metric: p95_latency_ms
+    threshold: 3500
+    direction: max
+    severity: critical
+    alert: pagerduty
+    description: "Production p95 response time SLO"
+
+  - metric: timeout_rate
+    threshold: 0.02
+    direction: max
+    severity: warning
+    alert: slack
+    description: "Request timeout rate"
+
+  - metric: fallback_rate
+    threshold: 0.10
+    direction: max
+    severity: warning
+    alert: slack
+    description: "Provider fallback activation rate"
+
+  - metric: tool_error_rate
+    threshold: 0.05
+    direction: max
+    severity: warning
+    alert: slack
+    description: "Tool call error or external dependency failure rate"
+
+  - metric: retrieval_empty_result_rate
+    threshold: 0.05
+    direction: max
+    severity: warning
+    alert: slack
+    description: "Queries returning zero retrieval results"
+
+  - metric: invalid_output_rate
+    threshold: 0.02
+    direction: max
+    severity: critical
+    alert: pagerduty
+    description: "Responses failing output schema validation or policy blocks"

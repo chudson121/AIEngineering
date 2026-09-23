@@ -1,0 +1,44 @@
+# RA Section 5.6 & 6 – Latency and performance SLO thresholds
+
+gates:
+  - metric: p50_latency_ms
+    threshold: 1500
+    direction: max
+    severity: warning
+    description: "Median response time"
+
+  - metric: p95_latency_ms
+    threshold: 3000
+    direction: max
+    severity: blocking
+    description: "p95 must not exceed SLO under representative load"
+
+  - metric: p99_latency_ms
+    threshold: 6000
+    direction: max
+    severity: warning
+    description: "p99 tail latency"
+
+  - metric: time_to_first_token_ms
+    threshold: 800
+    direction: max
+    severity: warning
+    description: "Streaming TTFT for interactive use cases"
+
+  - metric: completion_rate
+    threshold: 0.99
+    direction: min
+    severity: blocking
+    description: "Requests completing successfully end to end"
+
+  - metric: fallback_rate
+    threshold: 0.05
+    direction: max
+    severity: warning
+    description: "Requests routed to fallback provider"
+
+  - metric: tool_retry_rate
+    threshold: 0.10
+    direction: max
+    severity: warning
+    description: "Tool calls requiring retry due to external dependency faults"

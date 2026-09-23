@@ -1,0 +1,300 @@
+name: "04 · Regression Datasets & Baseline Comparison"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage: Staging / Pre-release
+# RA Section 4.2 – Regression dataset design
+# RA Section 6   – CI/CD gates and release thresholds
+# RA Section 9   – Governance – approval gates
+# Tools: DVC, MLflow, Evidently AI, pytest-benchmark, GitHub Environments
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_run:
+    workflows: ["03 · Agent Task Completion & Tool-Call Accuracy"]
+    types: [completed]
+    branches: [main, "release/**"]
+  workflow_dispatch:
+    inputs:
+      baseline_run_id:
+        description: "MLflow run ID to compare against (leave blank = last prod run)"
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
+  LLM_PROVIDER: ${{ vars.DEFAULT_LLM_PROVIDER || 'openai' }}
+
+jobs:
+  # ──────────────────────────────────────────────────────
+  # Job 1 – Run full regression dataset (all slices)
+  # Tool: RAGAS + DeepEval + custom runner
+  # Dataset slices: golden, boundary, adversarial, historical failures
+  # ──────────────────────────────────────────────────────
+  full-regression-run:
+    name: "Full Regression Dataset Run"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    outputs:
+      candidate_run_id: ${{ steps.log.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (OIDC)
+        if: vars.CLOUD_PROVIDER == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to AWS (OIDC)
+        if: vars.CLOUD_PROVIDER == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ vars.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install "dvc[azure,s3]" ragas deepeval langchain-openai \
+                      langchain-anthropic mlflow evidently rich
+
+      - name: Configure DVC remote (Azure)
+        if: vars.CLOUD_PROVIDER == 'azure'
+        run: |
+          dvc remote modify origin account_name "${{ secrets.AZURE_STORAGE_ACCOUNT }}"
+          dvc remote modify origin sas_token    "${{ secrets.AZURE_SAS_TOKEN }}"
+
+      - name: Configure DVC remote (AWS)
+        if: vars.CLOUD_PROVIDER == 'aws'
+        run: |
+          dvc remote modify origin access_key_id     "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          dvc remote modify origin secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          dvc remote modify origin region_name       "${{ vars.AWS_REGION }}"
+
+      - name: Pull all regression datasets via DVC
+        run: |
+          dvc pull evals/datasets/golden_set.dvc
+          dvc pull evals/datasets/boundary_set.dvc
+          dvc pull evals/datasets/adversarial_set.dvc
+          dvc pull evals/datasets/historical_failures.dvc
+
+      - name: Resolve LLM credentials
+        run: |
+          if [ "${{ env.LLM_PROVIDER }}" = "azure_openai" ]; then
+            echo "AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}"     >> $GITHUB_ENV
+            echo "AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}"       >> $GITHUB_ENV
+            echo "AZURE_OPENAI_DEPLOYMENT_NAME=${{ vars.AZURE_JUDGE_DEPLOYMENT }}" >> $GITHUB_ENV
+          elif [ "${{ env.LLM_PROVIDER }}" = "anthropic" ]; then
+            echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}"             >> $GITHUB_ENV
+          else
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"                   >> $GITHUB_ENV
+          fi
+
+      - name: Run regression suite across all dataset slices
+        run: |
+          python scripts/run_regression.py \
+            --golden         evals/datasets/golden_set.jsonl \
+            --boundary       evals/datasets/boundary_set.jsonl \
+            --adversarial    evals/datasets/adversarial_set.jsonl \
+            --failures       evals/datasets/historical_failures.jsonl \
+            --provider       ${{ env.LLM_PROVIDER }} \
+            --output-dir     reports/regression/ \
+            --mlflow-experiment "regression-suite"
+        env:
+          MLFLOW_TRACKING_URI:   ${{ env.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+          LANGSMITH_API_KEY:     ${{ secrets.LANGSMITH_API_KEY }}
+
+      - name: Log candidate run ID
+        id: log
+        run: |
+          RUN_ID=$(python scripts/get_last_mlflow_run.py \
+            --experiment "regression-suite" \
+            --tag "git_sha=${{ github.sha }}")
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Upload regression reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-reports
+          path: reports/regression/
+          retention-days: 90
+
+  # ──────────────────────────────────────────────────────
+  # Job 2 – Baseline comparison with Evidently AI
+  # Tool: Evidently AI (model monitoring + drift detection)
+  # ──────────────────────────────────────────────────────
+  baseline-comparison:
+    name: "Baseline vs Candidate Comparison (Evidently)"
+    runs-on: ubuntu-latest
+    needs: full-regression-run
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Evidently + MLflow
+        run: pip install evidently mlflow rich pandas
+
+      - name: Restore regression reports
+        uses: actions/download-artifact@v4
+        with:
+          name: regression-reports
+          path: reports/regression/
+
+      - name: Fetch baseline metrics from MLflow
+        run: |
+          python scripts/fetch_baseline.py \
+            --experiment  "regression-suite" \
+            --baseline-run-id "${{ inputs.baseline_run_id }}" \
+            --output      reports/baseline_metrics.json
+        env:
+          MLFLOW_TRACKING_URI:   ${{ env.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+
+      - name: Run Evidently comparison report
+        run: |
+          python scripts/compare_baseline.py \
+            --candidate   reports/regression/candidate_metrics.json \
+            --baseline    reports/baseline_metrics.json \
+            --output      reports/comparison_report.html \
+            --json-output reports/comparison_result.json
+        env:
+          MLFLOW_TRACKING_URI:   ${{ env.MLFLOW_TRACKING_URI }}
+
+      - name: Upload comparison report
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparison-report
+          path: |
+            reports/comparison_report.html
+            reports/comparison_result.json
+          retention-days: 90
+
+      - name: Enforce regression gate (no critical regressions)
+        # RA Section 6 – no regression beyond agreed tolerance vs baseline
+        run: |
+          python scripts/check_thresholds.py \
+            --report  reports/comparison_result.json \
+            --gates   config/thresholds/regression.yaml \
+            --fail-on-breach
+
+  # ──────────────────────────────────────────────────────
+  # Job 3 – Performance & latency benchmarks
+  # Tools: pytest-benchmark, locust (load), k6
+  # RA Section 5.6 – Performance, reliability, cost
+  # ──────────────────────────────────────────────────────
+  performance-benchmarks:
+    name: "Performance & Latency Benchmarks"
+    runs-on: ubuntu-latest
+    needs: full-regression-run
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install benchmark tools
+        run: pip install pytest-benchmark locust rich mlflow
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install k6 -y
+
+      - name: Resolve LLM credentials
+        run: |
+          if [ "${{ env.LLM_PROVIDER }}" = "azure_openai" ]; then
+            echo "AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}" >> $GITHUB_ENV
+            echo "AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}"   >> $GITHUB_ENV
+          elif [ "${{ env.LLM_PROVIDER }}" = "anthropic" ]; then
+            echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}"         >> $GITHUB_ENV
+          else
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"               >> $GITHUB_ENV
+          fi
+
+      - name: Run latency benchmarks (pytest-benchmark)
+        run: |
+          pytest tests/benchmarks/ \
+            --benchmark-json=reports/benchmark_results.json \
+            --benchmark-compare \
+            --benchmark-compare-fail=mean:10% \
+            -v
+
+      - name: Run load test (k6)
+        run: |
+          k6 run \
+            --out json=reports/k6_results.json \
+            --env LLM_PROVIDER=${{ env.LLM_PROVIDER }} \
+            --env ENDPOINT=${{ vars.STAGING_ENDPOINT }} \
+            monitoring/k6-load-test.js
+
+      - name: Enforce p95 latency SLO gate
+        # RA Section 6 – candidate p95 must not breach SLO
+        run: |
+          python scripts/check_thresholds.py \
+            --report  reports/k6_results.json \
+            --gates   config/thresholds/latency.yaml \
+            --fail-on-breach
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-benchmarks
+          path: reports/benchmark_results.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 4 – Human approval gate before staging promotion
+  # RA Section 6 – "human approval where required"
+  # ──────────────────────────────────────────────────────
+  human-approval-gate:
+    name: "Human Approval Gate"
+    runs-on: ubuntu-latest
+    needs: [baseline-comparison, performance-benchmarks]
+    environment: staging-approval   # GitHub Environment with required reviewers
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: comparison-report
+          path: reports/
+
+      - name: Print comparison summary for approvers
+        run: |
+          echo "=== Baseline vs Candidate Comparison ==="
+          cat reports/comparison_result.json | python -m json.tool
+
+      - name: Record approval evidence
+        run: |
+          echo "Approved by: ${{ github.actor }}" >> reports/approval-record.txt
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> reports/approval-record.txt
+          echo "Candidate SHA: ${{ github.sha }}"            >> reports/approval-record.txt
+
+      - name: Upload approval record
+        uses: actions/upload-artifact@v4
+        with:
+          name: approval-record
+          path: reports/approval-record.txt
+          retention-days: 365

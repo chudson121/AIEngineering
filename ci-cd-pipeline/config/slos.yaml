@@ -1,0 +1,41 @@
+# Service Level Objectives – used by production monitoring workflow
+# Align with your application's contractual commitments and measured baseline.
+
+service: ai-app
+
+objectives:
+  - name: availability
+    description: "Percentage of requests that complete without error"
+    target: 0.99
+    window: 30d
+
+  - name: p95_latency
+    description: "95th percentile response time in milliseconds"
+    target: 3000
+    window: 7d
+
+  - name: p99_latency
+    description: "99th percentile response time in milliseconds"
+    target: 6000
+    window: 7d
+
+  - name: groundedness
+    description: "Fraction of sampled responses passing groundedness check"
+    target: 0.95
+    window: 7d
+
+  - name: agent_task_success
+    description: "Fraction of agent tasks reaching verified terminal state"
+    target: 0.90
+    window: 7d
+
+prometheus_queries:
+  error_rate: |
+    sum(rate(http_requests_total{status=~"5.."}[5m]))
+    / sum(rate(http_requests_total[5m]))
+  p95_latency_ms: |
+    histogram_quantile(0.95,
+      sum(rate(http_request_duration_ms_bucket[5m])) by (le))
+  fallback_rate: |
+    sum(rate(llm_provider_fallback_total[5m]))
+    / sum(rate(llm_requests_total[5m]))

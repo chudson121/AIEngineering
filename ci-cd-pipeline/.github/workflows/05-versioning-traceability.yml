@@ -1,0 +1,298 @@
+name: "05 · Prompt/Model Versioning & Traceability"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage: Continuous – runs on every merge to main and on release tags
+# RA Section 4.1 – Versioned artifacts (prompts, models, datasets, tools)
+# RA Section 3   – Effective release manifest
+# Tools: MLflow Model Registry, LangSmith, DVC, GitHub Releases, ORAS (OCI)
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+    tags:     ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      promote_to_prod:
+        description: "Promote this version to production registry?"
+        required: true
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
+  REGISTRY: ghcr.io
+
+jobs:
+  # ──────────────────────────────────────────────────────
+  # Job 1 – Hash and register all prompt templates
+  # Tool: MLflow Prompt Registry / custom manifest builder
+  # ──────────────────────────────────────────────────────
+  register-prompts:
+    name: "Hash & Register Prompt Templates"
+    runs-on: ubuntu-latest
+    outputs:
+      prompt_bundle_hash: ${{ steps.register.outputs.bundle_hash }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install MLflow + Jinja2
+        run: pip install mlflow jinja2 rich
+
+      - name: Hash all prompt templates (SHA-256)
+        id: register
+        run: |
+          python scripts/register_prompts.py \
+            --prompt-dir prompts/ \
+            --experiment "prompt-registry" \
+            --git-sha    "${{ github.sha }}" \
+            --git-tag    "${{ github.ref_name }}" \
+            --output     reports/prompt-registry.json
+
+          BUNDLE=$(python -c "import json; d=json.load(open('reports/prompt-registry.json')); print(d['bundle_hash'])")
+          echo "bundle_hash=$BUNDLE" >> $GITHUB_OUTPUT
+        env:
+          MLFLOW_TRACKING_URI:   ${{ env.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+
+      - name: Upload prompt registry report
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-registry
+          path: reports/prompt-registry.json
+          retention-days: 365
+
+  # ──────────────────────────────────────────────────────
+  # Job 2 – Register model version in MLflow Model Registry
+  # Supports: OpenAI, Azure OpenAI, Anthropic, Bedrock
+  # ──────────────────────────────────────────────────────
+  register-model:
+    name: "Register Model Version (MLflow Registry)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (OIDC)
+        if: vars.CLOUD_PROVIDER == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to AWS (OIDC)
+        if: vars.CLOUD_PROVIDER == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ vars.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install MLflow + provider SDKs
+        run: pip install mlflow openai anthropic boto3 azure-ai-ml rich
+
+      - name: Register model routing config in MLflow
+        run: |
+          python scripts/register_model.py \
+            --config      config/model-routing.yaml \
+            --provider    ${{ vars.DEFAULT_LLM_PROVIDER }} \
+            --git-sha     "${{ github.sha }}" \
+            --registry-name "ai-app-models" \
+            --output      reports/model-registry.json
+        env:
+          MLFLOW_TRACKING_URI:   ${{ env.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+          # OpenAI
+          OPENAI_API_KEY:            ${{ secrets.OPENAI_API_KEY }}
+          # Azure OpenAI
+          AZURE_OPENAI_ENDPOINT:     ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:      ${{ secrets.AZURE_OPENAI_API_KEY }}
+          # Anthropic
+          ANTHROPIC_API_KEY:         ${{ secrets.ANTHROPIC_API_KEY }}
+          # AWS Bedrock
+          AWS_BEDROCK_REGION:        ${{ vars.AWS_REGION }}
+
+      - name: Upload model registry report
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-registry
+          path: reports/model-registry.json
+          retention-days: 365
+
+  # ──────────────────────────────────────────────────────
+  # Job 3 – Version evaluation datasets with DVC
+  # Tool: DVC + cloud object storage (Azure Blob / S3)
+  # ──────────────────────────────────────────────────────
+  version-datasets:
+    name: "Version Eval Datasets (DVC)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install DVC
+        run: pip install "dvc[azure,s3]"
+
+      - name: Configure Azure Blob Storage
+        if: vars.CLOUD_PROVIDER == 'azure'
+        run: |
+          dvc remote modify origin account_name "${{ secrets.AZURE_STORAGE_ACCOUNT }}"
+          dvc remote modify origin sas_token    "${{ secrets.AZURE_SAS_TOKEN }}"
+
+      - name: Configure AWS S3
+        if: vars.CLOUD_PROVIDER == 'aws'
+        run: |
+          dvc remote modify origin access_key_id     "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          dvc remote modify origin secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          dvc remote modify origin region_name       "${{ vars.AWS_REGION }}"
+
+      - name: Push updated datasets to remote
+        run: |
+          dvc add evals/datasets/
+          dvc push
+          git config --global user.email "ci@github-actions"
+          git config --global user.name  "GitHub Actions"
+          git add evals/datasets/*.dvc
+          git diff --staged --quiet || git commit -m "chore: update DVC dataset locks [skip ci]"
+
+  # ──────────────────────────────────────────────────────
+  # Job 4 – Build & publish effective release manifest
+  # Stored in: GitHub Release, MLflow, Azure Blob / S3
+  # ──────────────────────────────────────────────────────
+  publish-release-manifest:
+    name: "Publish Effective Release Manifest"
+    runs-on: ubuntu-latest
+    needs: [register-prompts, register-model, version-datasets]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-registry"
+          merge-multiple: true
+          path: reports/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install mlflow pyyaml rich
+
+      - name: Assemble final effective release manifest
+        run: |
+          python scripts/assemble_release_manifest.py \
+            --git-sha            "${{ github.sha }}" \
+            --git-tag            "${{ github.ref_name }}" \
+            --prompt-registry    reports/prompt-registry.json \
+            --model-registry     reports/model-registry.json \
+            --cloud-provider     ${{ vars.CLOUD_PROVIDER }} \
+            --llm-provider       ${{ vars.DEFAULT_LLM_PROVIDER }} \
+            --output             release-manifest-final.json
+        env:
+          MLFLOW_TRACKING_URI:   ${{ env.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+
+      - name: Upload manifest to cloud (Azure)
+        if: vars.CLOUD_PROVIDER == 'azure'
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob upload \
+              --account-name "${{ secrets.AZURE_STORAGE_ACCOUNT }}" \
+              --container-name "release-manifests" \
+              --name "${{ github.sha }}/release-manifest.json" \
+              --file release-manifest-final.json \
+              --auth-mode login
+
+      - name: Upload manifest to cloud (AWS S3)
+        if: vars.CLOUD_PROVIDER == 'aws'
+        run: |
+          aws s3 cp release-manifest-final.json \
+            s3://${{ vars.S3_MANIFEST_BUCKET }}/${{ github.sha }}/release-manifest.json
+
+      - name: Publish GitHub Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-manifest-final.json
+          generate_release_notes: true
+          tag_name: ${{ github.ref_name }}
+
+      - name: Upload manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-final
+          path: release-manifest-final.json
+          retention-days: 365
+
+  # ──────────────────────────────────────────────────────
+  # Job 5 – Promote model to prod registry (if approved)
+  # ──────────────────────────────────────────────────────
+  promote-to-production:
+    name: "Promote to Production Registry"
+    runs-on: ubuntu-latest
+    needs: publish-release-manifest
+    if: ${{ inputs.promote_to_prod == 'true' || startsWith(github.ref, 'refs/tags/') }}
+    environment: production-registry-approval  # Requires reviewer sign-off
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install MLflow
+        run: pip install mlflow
+
+      - name: Promote model version to Production stage
+        run: |
+          python scripts/promote_model.py \
+            --registry-name "ai-app-models" \
+            --git-sha       "${{ github.sha }}" \
+            --stage         "Production" \
+            --approver      "${{ github.actor }}"
+        env:
+          MLFLOW_TRACKING_URI:   ${{ env.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+
+      - name: Publish LangSmith dataset snapshot
+        run: |
+          python scripts/publish_langsmith_dataset.py \
+            --project "${{ vars.LANGSMITH_PROJECT }}" \
+            --git-sha "${{ github.sha }}" \
+            --tag     "production-${{ github.ref_name }}"
+        env:
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}

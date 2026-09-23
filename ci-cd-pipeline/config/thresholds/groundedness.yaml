@@ -1,0 +1,32 @@
+# RA Section 5.3 & 6 – Groundedness and hallucination thresholds
+
+gates:
+  - metric: faithfulness
+    threshold: 0.95
+    direction: min
+    severity: blocking
+    description: "95% of claims in answers are supported by retrieved sources"
+
+  - metric: hallucination_rate
+    threshold: 0.05
+    direction: max
+    severity: blocking
+    description: "Unsupported or fabricated claims must not exceed 5%"
+
+  - metric: unsupported_claim_rate
+    threshold: 0.05
+    direction: max
+    severity: blocking
+    description: "Claims with no source evidence"
+
+  - metric: out_of_date_claim_rate
+    threshold: 0.02
+    direction: max
+    severity: warning
+    description: "Claims referencing stale corpus content"
+
+  - metric: critical_policy_cases_passed
+    threshold: 1.00
+    direction: min
+    severity: blocking
+    description: "All critical policy answer cases must pass individually"

@@ -1,0 +1,328 @@
+name: "06 · Deploy – Shadow / Canary / Production"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage: Production delivery
+# RA Section 6   – Release sequence: shadow → canary → expand/rollback
+# RA Section 7   – Runtime architecture and controls
+# RA Section 8   – Production monitoring bootstrap
+# Tools: Azure Container Apps / AWS ECS (via OIDC), OpenTelemetry, LangFuse,
+#        Prometheus, Grafana, Helm, kubectl
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_run:
+    workflows: ["04 · Regression Datasets & Baseline Comparison"]
+    types: [completed]
+    branches: [main, "release/**"]
+  workflow_dispatch:
+    inputs:
+      deployment_mode:
+        description: "Deployment mode"
+        required: true
+        default: "shadow"
+        type: choice
+        options: [shadow, canary, full]
+      canary_weight:
+        description: "Canary traffic weight % (1-100)"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+  deployments: write
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  DEPLOYMENT_MODE: ${{ inputs.deployment_mode || 'shadow' }}
+  CANARY_WEIGHT:   ${{ inputs.canary_weight   || '5' }}
+  IMAGE_NAME:      ${{ github.repository }}/ai-app
+  REGISTRY:        ghcr.io
+
+jobs:
+  # ──────────────────────────────────────────────────────
+  # Job 1 – Build & push container image
+  # ──────────────────────────────────────────────────────
+  build-image:
+    name: "Build & Push Container Image"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build and push container image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+      - name: Sign image with Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the container image
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+
+  # ──────────────────────────────────────────────────────
+  # Job 2a – Deploy to Azure Container Apps
+  # Tool: Azure CLI + azure/container-apps-deploy-action
+  # ──────────────────────────────────────────────────────
+  deploy-azure:
+    name: "Deploy to Azure Container Apps"
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: vars.CLOUD_PROVIDER == 'azure'
+    environment: ${{ inputs.deployment_mode == 'full' && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Azure Container Apps (shadow/canary)
+        if: env.DEPLOYMENT_MODE != 'full'
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          appSourcePath: .
+          acrName: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+          containerAppName: ai-app-${{ env.DEPLOYMENT_MODE }}
+          resourceGroup:    ${{ vars.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: >-
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          environmentVariables: >-
+            LLM_PROVIDER=${{ vars.DEFAULT_LLM_PROVIDER }}
+            AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}
+            AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}
+            ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            OTEL_EXPORTER_OTLP_ENDPOINT=${{ vars.OTEL_ENDPOINT }}
+            LANGFUSE_PUBLIC_KEY=${{ secrets.LANGFUSE_PUBLIC_KEY }}
+            LANGFUSE_SECRET_KEY=${{ secrets.LANGFUSE_SECRET_KEY }}
+            LANGFUSE_HOST=${{ vars.LANGFUSE_HOST }}
+
+      - name: Set canary traffic weight
+        if: env.DEPLOYMENT_MODE == 'canary'
+        run: |
+          az containerapp ingress traffic set \
+            --name            ai-app-canary \
+            --resource-group  ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --revision-weight latest=${{ env.CANARY_WEIGHT }} \
+                               stable=$((100 - ${{ env.CANARY_WEIGHT }}))
+
+      - name: Full production deploy (blue/green swap)
+        if: env.DEPLOYMENT_MODE == 'full'
+        run: |
+          az containerapp update \
+            --name           ai-app \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image          "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+
+  # ──────────────────────────────────────────────────────
+  # Job 2b – Deploy to AWS ECS (Fargate)
+  # Tool: aws-actions/amazon-ecs-deploy-task-definition
+  # ──────────────────────────────────────────────────────
+  deploy-aws:
+    name: "Deploy to AWS ECS Fargate"
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: vars.CLOUD_PROVIDER == 'aws'
+    environment: ${{ inputs.deployment_mode == 'full' && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Render ECS task definition
+        id: render-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/aws/ecs-task-definition.json
+          container-name: ai-app
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          environment-variables: |
+            LLM_PROVIDER=${{ vars.DEFAULT_LLM_PROVIDER }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+            OTEL_EXPORTER_OTLP_ENDPOINT=${{ vars.OTEL_ENDPOINT }}
+            LANGFUSE_PUBLIC_KEY=${{ secrets.LANGFUSE_PUBLIC_KEY }}
+            LANGFUSE_SECRET_KEY=${{ secrets.LANGFUSE_SECRET_KEY }}
+            LANGFUSE_HOST=${{ vars.LANGFUSE_HOST }}
+
+      - name: Deploy to ECS (shadow/canary)
+        if: env.DEPLOYMENT_MODE != 'full'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-task.outputs.task-definition }}
+          service:         ai-app-${{ env.DEPLOYMENT_MODE }}
+          cluster:         ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Update CodeDeploy canary traffic weight
+        if: env.DEPLOYMENT_MODE == 'canary'
+        run: |
+          aws deploy create-deployment \
+            --application-name  ai-app \
+            --deployment-group  ai-app-canary \
+            --deployment-config-name CodeDeployDefault.ECSLinear10PercentEvery1Minute \
+            --description       "Canary ${{ env.CANARY_WEIGHT }}% - SHA ${{ github.sha }}"
+
+      - name: Full production deploy
+        if: env.DEPLOYMENT_MODE == 'full'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:              ${{ steps.render-task.outputs.task-definition }}
+          service:                      ai-app-prod
+          cluster:                      ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability:   true
+
+  # ──────────────────────────────────────────────────────
+  # Job 3 – Bootstrap OpenTelemetry + LangFuse tracing
+  # RA Section 8 – Trace structure and data handling
+  # ──────────────────────────────────────────────────────
+  bootstrap-observability:
+    name: "Bootstrap Observability (OTel + LangFuse)"
+    runs-on: ubuntu-latest
+    needs: [deploy-azure, deploy-aws]
+    if: always() && (needs.deploy-azure.result == 'success' || needs.deploy-aws.result == 'success')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install OTel + LangFuse SDKs
+        run: pip install opentelemetry-sdk opentelemetry-exporter-otlp langfuse rich
+
+      - name: Verify OTel collector endpoint
+        run: |
+          python scripts/verify_otel.py \
+            --endpoint ${{ vars.OTEL_ENDPOINT }} \
+            --git-sha  "${{ github.sha }}"
+        env:
+          OTEL_SERVICE_NAME:          ai-app
+          OTEL_RESOURCE_ATTRIBUTES:   "git.sha=${{ github.sha }},deployment.mode=${{ env.DEPLOYMENT_MODE }}"
+
+      - name: Register deployment in LangFuse
+        run: |
+          python scripts/register_langfuse_deploy.py \
+            --git-sha    "${{ github.sha }}" \
+            --mode       "${{ env.DEPLOYMENT_MODE }}" \
+            --provider   "${{ vars.DEFAULT_LLM_PROVIDER }}"
+        env:
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_HOST:       ${{ vars.LANGFUSE_HOST }}
+
+  # ──────────────────────────────────────────────────────
+  # Job 4 – Automated rollback trigger
+  # Watches error rate post-deploy; rolls back if threshold breached
+  # RA Section 6 – "pause or roll back on sustained critical failure"
+  # ──────────────────────────────────────────────────────
+  canary-health-check:
+    name: "Canary Health Check & Auto-Rollback"
+    runs-on: ubuntu-latest
+    needs: bootstrap-observability
+    if: env.DEPLOYMENT_MODE == 'canary' || env.DEPLOYMENT_MODE == 'shadow'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install monitoring tools
+        run: pip install prometheus-client requests rich
+
+      - name: Poll canary metrics (10-min window)
+        id: health
+        run: |
+          python scripts/canary_health_check.py \
+            --prometheus-url  "${{ vars.PROMETHEUS_URL }}" \
+            --window-minutes  10 \
+            --error-threshold 0.05 \
+            --latency-p95-ms  3000 \
+            --output          reports/canary-health.json
+        env:
+          PROMETHEUS_BEARER: ${{ secrets.PROMETHEUS_BEARER }}
+
+      - name: Auto-rollback on breach (Azure)
+        if: failure() && vars.CLOUD_PROVIDER == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Execute Azure rollback
+        if: failure() && vars.CLOUD_PROVIDER == 'azure'
+        run: |
+          az containerapp revision set-mode \
+            --name           ai-app-canary \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --mode           single
+          echo "::error::Canary rolled back due to health gate breach"
+
+      - name: Auto-rollback on breach (AWS)
+        if: failure() && vars.CLOUD_PROVIDER == 'aws'
+        run: |
+          aws deploy stop-deployment \
+            --deployment-id $(cat reports/canary-health.json | python -c "import json,sys; print(json.load(sys.stdin)['deployment_id'])")
+          echo "::error::Canary rolled back due to health gate breach"
+
+      - name: Upload canary health report
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-health
+          path: reports/canary-health.json

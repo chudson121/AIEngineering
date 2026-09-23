@@ -1,0 +1,246 @@
+name: "01 · Validate Artifacts & Contracts"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage: Local / Pull Request
+# RA Section 5.1 – Evaluation ladder (pre-commit / PR gate)
+# RA Section 4.1 – Versioned artifacts
+# Triggered on: every PR that touches prompts, tools, configs, or app code
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main, develop, "feature/**", "release/**"]
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "prompts/**"
+      - "tools/**"
+      - "config/**"
+      - "src/**"
+      - "evals/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  POETRY_VERSION: "1.7.1"
+
+jobs:
+  # ──────────────────────────────────────────────────────
+  # Job 1 – Prompt template validation
+  # Tool: Jinja2 renderer + custom schema validator
+  # ──────────────────────────────────────────────────────
+  validate-prompts:
+    name: "Validate Prompt Templates"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install jinja2 jsonschema pyyaml rich click
+
+      - name: Render and validate all prompt templates
+        run: |
+          python scripts/validate_prompts.py \
+            --prompt-dir prompts/ \
+            --schema-dir config/prompt-schemas/ \
+            --output reports/prompt-validation.json
+        env:
+          # Dummy values – no LLM call needed for render validation
+          OPENAI_API_KEY: "sk-dummy"
+
+      - name: Upload prompt validation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-validation-report
+          path: reports/prompt-validation.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 2 – Tool / function schema validation
+  # Tool: jsonschema, pydantic v2
+  # ──────────────────────────────────────────────────────
+  validate-tool-schemas:
+    name: "Validate Tool Schemas"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install pydantic jsonschema
+
+      - name: Validate all tool JSON schemas
+        run: |
+          python scripts/validate_tool_schemas.py \
+            --tools-dir tools/ \
+            --output reports/tool-schema-validation.json
+
+      - name: Upload tool schema report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-schema-report
+          path: reports/tool-schema-validation.json
+
+  # ──────────────────────────────────────────────────────
+  # Job 3 – Release manifest integrity check
+  # Tool: Custom manifest builder + DVC
+  # ──────────────────────────────────────────────────────
+  build-release-manifest:
+    name: "Build & Verify Release Manifest"
+    runs-on: ubuntu-latest
+    needs: [validate-prompts, validate-tool-schemas]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install DVC + storage backends
+        run: |
+          pip install "dvc[azure,s3]" pyyaml rich
+
+      - name: Configure cloud storage (Azure)
+        if: vars.CLOUD_PROVIDER == 'azure'
+        run: |
+          dvc remote modify origin account_name "${{ secrets.AZURE_STORAGE_ACCOUNT }}"
+          dvc remote modify origin sas_token   "${{ secrets.AZURE_SAS_TOKEN }}"
+        env:
+          DVC_REMOTE: origin
+
+      - name: Configure cloud storage (AWS)
+        if: vars.CLOUD_PROVIDER == 'aws'
+        run: |
+          dvc remote modify origin access_key_id     "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          dvc remote modify origin secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          dvc remote modify origin region_name       "${{ vars.AWS_REGION }}"
+        env:
+          DVC_REMOTE: origin
+
+      - name: Build effective release manifest
+        run: |
+          python scripts/build_manifest.py \
+            --git-sha "${{ github.sha }}" \
+            --git-ref "${{ github.ref }}" \
+            --output  release-manifest.json
+        env:
+          CLOUD_PROVIDER: ${{ vars.CLOUD_PROVIDER }}
+
+      - name: Upload release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release-manifest.json
+          retention-days: 90
+
+  # ──────────────────────────────────────────────────────
+  # Job 4 – Security & secrets scan
+  # Tools: Gitleaks, Trufflehog
+  # ──────────────────────────────────────────────────────
+  security-scan:
+    name: "Security & Secrets Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks – detect secrets in history
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: TruffleHog – scan for high-entropy strings
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  # ──────────────────────────────────────────────────────
+  # Job 5 – Unit tests
+  # Tools: pytest, pytest-cov
+  # ──────────────────────────────────────────────────────
+  unit-tests:
+    name: "Unit Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ \
+            --cov=src \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=html:reports/coverage-html \
+            --junitxml=reports/unit-tests.xml \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/coverage.xml
+
+  # ──────────────────────────────────────────────────────
+  # Job 6 – PR summary comment
+  # ──────────────────────────────────────────────────────
+  pr-summary:
+    name: "Post PR Validation Summary"
+    runs-on: ubuntu-latest
+    needs: [validate-prompts, validate-tool-schemas, build-release-manifest, security-scan, unit-tests]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-manifest
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const manifest = JSON.parse(fs.readFileSync('release-manifest.json', 'utf8'));
+            const body = `## ✅ Artifact Validation Passed\n\n` +
+              `| Field | Value |\n|---|---|\n` +
+              `| Git SHA | \`${manifest.git_sha}\` |\n` +
+              `| Prompt Hash | \`${manifest.prompt_hash}\` |\n` +
+              `| Tool Schema Hash | \`${manifest.tool_schema_hash}\` |\n` +
+              `| Timestamp | ${manifest.timestamp} |\n\n` +
+              `All artifact contracts validated. Pipeline continues to evaluation stage.`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
